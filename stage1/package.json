@@ -1,0 +1,22 @@
+{
+  "name": "linkedin-scraper-stage1",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Stage 1: LinkedIn login test with Playwright",
+  "main": "src/stage1.js",
+  "scripts": {
+    "start": "node src/stage1.js",
+    "server": "node src/server.js",
+    "test": "HEADLESS=false node src/stage1.js"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0",
+    "dotenv": "^16.3.1",
+    "@supabase/supabase-js": "^2.43.0",
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  },
+  "keywords": ["playwright", "linkedin", "automation", "login"],
+  "author": "",
+  "license": "MIT"
+}

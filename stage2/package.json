@@ -1,0 +1,24 @@
+{
+  "name": "linkedin-scraper-stage2",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "server":"node src/server.js",
+    "start": "node src/stage2.js",
+    "scrape": "node src/stage2.js",
+    "test:xpaths": "node src/dev/inspect-xpaths.js",
+    "unified": "node src/unified-server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "dotenv": "^16.4.5",
+    "playwright": "^1.48.2",
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "eslint": "^9.11.1"
+  }
+}
