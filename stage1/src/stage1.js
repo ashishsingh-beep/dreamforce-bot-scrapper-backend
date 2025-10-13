@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 // Static import (preferred). Some environments (packagers) may tree-shake; we also add a runtime fallback.
 import { chromium, devices } from 'playwright';
-import { loginLinkedIn } from './utils/login.js';
+import { loginLinkedIn, loginLinkedInWithCookies, loginWithCookiesThenCredentials } from './utils/login.js';
 import { setupStealthContext, preparePage } from './utils/stealth.js';
 import { saveAllLeads } from './utils/supabase.js';
 import { saveJson } from './utils/saveJson.js';
@@ -15,6 +15,7 @@ export function nowTs() {
 export async function runScrape({
   email,
   password,
+  cookies = null,
   keywords = '',
   searchUrl = '',
   durationSec = 0,
@@ -26,7 +27,7 @@ export async function runScrape({
   keepOpen = false,
   saveJsonFile = true,
 }) {
-  if (!email || !password) throw new Error('Missing email or password');
+  if (!cookies && (!email || !password)) throw new Error('Missing credentials: provide cookies or email+password');
   if (!searchUrl && !keywords) console.log('[info] Neither searchUrl nor keywords provided. Will stop after login.');
   if (searchUrl && keywords) console.log('[warn] Both searchUrl and keywords supplied. Using searchUrl and ignoring keywords.');
 
@@ -86,8 +87,18 @@ export async function runScrape({
 
   try {
     console.log(`[${nowTs()}] Attempting login...`);
-    await loginLinkedIn(page, email, password);
-    console.log(`[${nowTs()}] ✅ LOGIN SUCCESS!`);
+    let refreshedCookies = null;
+    const hybrid = await loginWithCookiesThenCredentials({ context, page, cookies, email, password });
+    if (!hybrid?.success) {
+      throw new Error(hybrid?.error || 'Login failed');
+    }
+    if (Array.isArray(hybrid.refreshedCookies)) {
+      refreshedCookies = hybrid.refreshedCookies;
+    }
+    summary.method = hybrid.method || 'unknown';
+    summary.attempts = typeof hybrid.attempts === 'number' ? hybrid.attempts : 1;
+    console.log(`[${nowTs()}] ✅ LOGIN SUCCESS via ${summary.method} (attempts=${summary.attempts})`);
+    if (refreshedCookies) summary.refreshedCookies = refreshedCookies;
 
     if (searchUrl || keywords) {
       if (searchUrl) {

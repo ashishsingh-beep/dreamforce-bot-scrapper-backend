@@ -5,7 +5,8 @@ let supabase = null;
 export function getSupabase() {
   if (supabase) return supabase;
   const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_KEY;
+  // Prefer service key for writes like updating accounts.status
+  const key = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY;
   if (!url || !key) {
     throw new Error('Missing SUPABASE_URL or SUPABASE_ANON_KEY/SUPABASE_SERVICE_KEY in env');
   }
@@ -53,23 +54,58 @@ export async function fetchNextPendingRequest() {
   return data && data.length ? data[0] : null;
 }
 
-/**
- * Select most recently created account for this request
- * Criteria: status in ('active','temp') AND created_by = request.request_by
- * Order by created_at DESC limit 1
- */
-export async function selectAccountForRequest(request) {
-  if (!request) return null;
+// Fetch all active accounts with cookies available
+export async function fetchActiveAccounts() {
   const client = getSupabase();
   const { data, error } = await client
     .from('accounts')
-    .select('*')
-    .in('status', ['active', 'temp'])
-    .eq('created_by', request.request_by)
-    .order('created_at', { ascending: false })
-    .limit(1);
+    .select('email_id, password, cookies, status, created_at')
+    .eq('status', 'active');
   if (error) throw error;
-  return data && data.length ? data[0] : null;
+  return data || [];
+}
+
+export function pickRandomAccount(accounts) {
+  if (!accounts || !accounts.length) return null;
+  const idx = Math.floor(Math.random() * accounts.length);
+  return accounts[idx];
+}
+
+export async function markAccountErrored(emailId) {
+  if (!emailId) return;
+  const client = getSupabase();
+  const { error } = await client
+    .from('accounts')
+    .update({ status: 'error' })
+    .eq('email_id', emailId);
+  if (error) throw error;
+}
+
+export async function updateAccountCookies(emailId, cookiesArray) {
+  if (!emailId || !Array.isArray(cookiesArray)) return;
+  const client = getSupabase();
+  const { error } = await client
+    .from('accounts')
+    .update({ cookies: cookiesArray })
+    .eq('email_id', emailId);
+  if (error) throw error;
+}
+
+export async function incrementLoginAttempts(emailId, count = 1) {
+  if (!emailId || !Number.isFinite(count) || count <= 0) return;
+  const client = getSupabase();
+  const { error } = await client
+    .rpc('increment_login_attempts', { p_email: emailId, p_by: count });
+  if (error) {
+    // Fallback if RPC not present: do a naive update using expression if supported
+    try {
+      const { error: updErr } = await client
+        .from('accounts')
+        .update({ num_login_attempts: undefined })
+        .eq('email_id', emailId);
+      if (updErr) throw updErr;
+    } catch {}
+  }
 }
 
 export async function markRequestFulfilled(requestId, { success, errorMessage, runId, totalLeads } = {}) {

@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { runScrape } from './stage1.js';
-import { fetchNextPendingRequest, selectAccountForRequest, markRequestFulfilled } from './utils/supabase.js';
+import { fetchNextPendingRequest, fetchActiveAccounts, pickRandomAccount, markAccountErrored, markRequestFulfilled, updateAccountCookies, incrementLoginAttempts } from './utils/supabase.js';
 
 const app = express();
 app.use(cors()); // open CORS per requirement
@@ -86,36 +86,66 @@ app.post('/auto-scrape', async (_req, res) => {
     return res.status(500).json({ success: false, error: 'Failed fetching pending request: ' + e.message });
   }
   if (!requestRow) return res.status(404).json({ success: false, message: 'No pending requests' });
-
-  let account;
+  
+  // Load active accounts with cookies; we'll retry across them on failures
+  let accounts = [];
   try {
-    account = await selectAccountForRequest(requestRow);
+    accounts = await fetchActiveAccounts();
   } catch (e) {
-    return res.status(500).json({ success: false, error: 'Failed selecting account: ' + e.message });
+    return res.status(500).json({ success: false, error: 'Failed loading active accounts: ' + e.message });
   }
-  if (!account) return res.status(400).json({ success: false, message: 'No suitable account (active/temp) for this request_by' });
+  if (!accounts.length) return res.status(400).json({ success: false, message: 'No active accounts found' });
 
   // Build scraper payload
   const keywords = (requestRow.keywords || '').trim();
   if (!keywords) return res.status(400).json({ success: false, message: 'Request has empty keywords' });
 
   const durationSec = typeof requestRow.load_time === 'number' ? Math.max(0, requestRow.load_time) : 0; // load_time referenced as duration
+  const searchUrl = (requestRow.search_url || '').trim();
 
   running = true;
   let result;
   try {
-    result = await runScrape({
-      email: account.email_id,
-      password: account.password,
-      keywords,
-      searchUrl: '',
-      durationSec,
-      tag: requestRow.tag,
-      userId: requestRow.request_by || null,
-      headless: false, // headfull as requested
-      keepOpen: false,
-      saveJsonFile: true
-    });
+    // Retry loop over available accounts
+    let lastErr = null;
+    for (let attempt = 0; attempt < accounts.length; attempt++) {
+      const account = pickRandomAccount(accounts);
+      // remove picked to avoid reuse
+      accounts = accounts.filter(a => a !== account);
+      try {
+        result = await runScrape({
+          email: account.email_id,
+          password: account.password,
+          cookies: account.cookies || [],
+          keywords: searchUrl ? '' : keywords,
+          searchUrl: searchUrl || '',
+          durationSec,
+          tag: requestRow.tag,
+          userId: requestRow.request_by || null,
+          headless: false,
+          keepOpen: false,
+          saveJsonFile: true
+        });
+        // Increment attempts: cookie try is always one; add one more if manual fallback used
+        try {
+          const add = result?.method === 'manual' ? 2 : 1;
+          await incrementLoginAttempts(account.email_id, add);
+        } catch {}
+        if (result?.success) {
+          // If we got refreshed cookies, persist
+          if (Array.isArray(result.refreshedCookies)) {
+            try { await updateAccountCookies(account.email_id, result.refreshedCookies); } catch {}
+          }
+          break;
+        }
+        lastErr = new Error(result?.error || 'Unknown failure');
+      } catch (e) {
+        lastErr = e;
+        // mark account error and continue
+        try { await markAccountErrored(account.email_id); } catch {}
+      }
+    }
+    if (!result?.success) throw (lastErr || new Error('All accounts failed'));
   } catch (e) {
     result = { success: false, error: e.message };
   } finally {
@@ -133,7 +163,7 @@ app.post('/auto-scrape', async (_req, res) => {
   return res.status(result.success ? 200 : 500).json({
     mode: 'auto',
     request_id: requestRow.request_id,
-    account: account.email_id,
+    account: result?.success ? 'cookie-account-used' : 'n/a',
     durationSec,
     ...result
   });
@@ -160,29 +190,49 @@ if (autoEnabled) {
       return;
     }
     if (!requestRow) return; // nothing to do this cycle
-    let account;
-    try { account = await selectAccountForRequest(requestRow); } catch (e) {
-      console.warn('[auto] selectAccountForRequest failed:', e.message); return; }
-    if (!account) return; // no valid account
+    let accounts = [];
+    try { accounts = await fetchActiveAccounts(); } catch (e) {
+      console.warn('[auto] fetchActiveAccountsWithCookies failed:', e.message); return; }
+    if (!accounts.length) return; // no valid account
     const keywords = (requestRow.keywords || '').trim();
     if (!keywords) return; // skip empty
     const durationSec = typeof requestRow.load_time === 'number' ? Math.max(0, requestRow.load_time) : 0;
+    const searchUrl = (requestRow.search_url || '').trim();
     running = true;
     let result;
     try {
-      console.log(`[auto] Running request ${requestRow.request_id} with account ${account.email_id}`);
-      result = await runScrape({
-        email: account.email_id,
-        password: account.password,
-        keywords,
-        searchUrl: '',
-        durationSec,
-        tag: requestRow.tag,
-        userId: requestRow.request_by || null,
-        headless: false,
-        keepOpen: false,
-        saveJsonFile: true
-      });
+      console.log(`[auto] Running request ${requestRow.request_id} with cookie-based login`);
+      let lastErr = null;
+      for (let attempt = 0; attempt < accounts.length; attempt++) {
+        const account = pickRandomAccount(accounts);
+        accounts = accounts.filter(a => a !== account);
+        try {
+          result = await runScrape({
+            email: account.email_id,
+            password: account.password,
+            cookies: account.cookies || [],
+            keywords: searchUrl ? '' : keywords,
+            searchUrl: searchUrl || '',
+            durationSec,
+            tag: requestRow.tag,
+            userId: requestRow.request_by || null,
+            headless: false,
+            keepOpen: false,
+            saveJsonFile: true
+          });
+          if (result?.success) {
+            if (Array.isArray(result.refreshedCookies)) {
+              try { await updateAccountCookies(account.email_id, result.refreshedCookies); } catch {}
+            }
+            break;
+          }
+          lastErr = new Error(result?.error || 'Unknown failure');
+        } catch (e) {
+          lastErr = e;
+          try { await markAccountErrored(account.email_id); } catch {}
+        }
+      }
+      if (!result?.success) throw (lastErr || new Error('All accounts failed'));
     } catch (e) {
       console.warn('[auto] scrape failed:', e.message);
     } finally {

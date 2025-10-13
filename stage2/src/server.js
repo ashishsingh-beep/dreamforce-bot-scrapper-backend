@@ -29,7 +29,7 @@ app.use(express.json({ limit: '1mb' }));
 
 // In-memory job registry
 const jobs = new Map();
-// Global single-account gate: ensures only one active Playwright worker across all jobs.
+// Global single-worker gate.
 let activeWorker = false;
 
 // Shape helper (single-account version)
@@ -122,8 +122,6 @@ app.post('/stage2/scrape-multi', async (req,res) => {
       const workerPath = path.join(__dirname, 'worker-stage2.js');
       const child = fork(workerPath, [], { stdio: ['inherit','inherit','inherit','ipc'] });
       child.send({ type: 'start-session', payload: {
-        email: account.email,
-        password: account.password,
         urls: urlList,
         options: { headless: false, writeJson: false, minutePacing: true, verbose: true },
         jobId: job.jobId,
@@ -176,11 +174,9 @@ app.post('/stage2/scrape-batch', async (req,res) => {
     const workerPath = path.join(__dirname, 'worker-stage2.js');
     const child = fork(workerPath, [], { stdio: ['inherit','inherit','inherit','ipc'] });
     child.send({ type: 'start-session', payload: {
-      email: first.email,
-      password: first.password,
       urls: uniq,
       options: {
-        headless: options?.headless === false ? false : false,
+        headless: false,
         writeJson: false,
         minutePacing: options?.minutePacing === false ? false : true,
         verbose: false
@@ -232,7 +228,7 @@ app.get('/stage2/jobs/:jobId', (req,res) => {
 // To adjust behavior, edit code directly. AUTO_SCRAPE_ENABLED is hard-coded true per request.
 // ------------------------
 const AUTO_SCRAPE_ENABLED = true;
-const AUTO_INTERVAL_MS = 600; // 0.6s
+const AUTO_INTERVAL_MS = 6000; // less aggressive
 if (AUTO_SCRAPE_ENABLED) {
   console.log(`[stage2:auto] HARD ENABLED scheduler @ ${AUTO_INTERVAL_MS}ms (WARNING: very fast)`);
   setInterval(async () => {
@@ -260,18 +256,9 @@ if (AUTO_SCRAPE_ENABLED) {
         .order('created_at', { ascending: true })
         .limit(40);
       if (leadsErr || !leads || !leads.length) return;
-      const { data: accountRow, error: acctErr } = await supabase
-        .from('accounts')
-        .select('email_id, password, status, created_at')
-        .in('status', ['active','temp'])
-        .eq('created_by', targetUserId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      if (acctErr || !accountRow) return; // no account
-  const urls = leads.map(l => l.linkedin_url).filter(Boolean).slice(0,40);
+      const urls = leads.map(l => l.linkedin_url).filter(Boolean).slice(0,40);
       if (!urls.length) return;
-      const job = createSingleJob(accountRow.email_id, urls, 'auto');
+      const job = createSingleJob('multi-account-cookie', urls, 'auto');
       job.status = 'running';
       job.accounts[0].state = 'running';
       job.auto = true;
@@ -280,8 +267,6 @@ if (AUTO_SCRAPE_ENABLED) {
       const workerPath = path.join(__dirname, 'worker-stage2.js');
       const child = fork(workerPath, [], { stdio: ['inherit','inherit','inherit','ipc'] });
       child.send({ type: 'start-session', payload: {
-        email: accountRow.email_id,
-        password: accountRow.password,
         urls,
         options: { headless: false, writeJson: false, minutePacing: true, verbose: false },
         jobId: job.jobId,
@@ -334,7 +319,7 @@ if (AUTO_SCRAPE_ENABLED) {
 // NOTE: relies on worker to mark scrapped when saving details in saveToLeadDetails.
 app.post('/stage2/auto-scrape', async (req,res) => {
   try {
-    const { userId, limit } = req.body || {};
+  const { userId, limit } = req.body || {};
     const take = Math.min(Math.max(Number(limit)||10, 1), 50); // cap at 50
 
     // Step 1: determine target user & leads
@@ -364,17 +349,6 @@ app.post('/stage2/auto-scrape', async (req,res) => {
     if (!leads || !leads.length) return res.status(404).json({ error: 'No pending leads for user' });
 
     // Step 2: pick newest matching account
-    const { data: accountRow, error: acctErr } = await supabase
-      .from('accounts')
-      .select('email_id, password, status, created_at')
-      .in('status', ['active','temp'])
-      .eq('created_by', targetUserId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (acctErr) return res.status(500).json({ error: 'Account lookup failed: ' + acctErr.message });
-    if (!accountRow) return res.status(400).json({ error: 'No active/temp account for user' });
-
     const urls = leads.map(l => l.linkedin_url).filter(Boolean);
     if (!urls.length) return res.status(400).json({ error: 'Leads missing linkedin_url values' });
 
@@ -384,7 +358,7 @@ app.post('/stage2/auto-scrape', async (req,res) => {
       status: 'running',
       createdAt: new Date().toISOString(),
       completedAt: null,
-      accounts: [ { idx:0, email: accountRow.email_id, mode:'auto', assigned: urls.length, success:0, failure:0, state:'running' } ],
+  accounts: [ { idx:0, email: 'multi-account-cookie', mode:'auto', assigned: urls.length, success:0, failure:0, state:'running' } ],
       total: { assigned: urls.length, success:0, failure:0 },
       errors: [],
       auto: true,
@@ -395,8 +369,6 @@ app.post('/stage2/auto-scrape', async (req,res) => {
     const workerPath = path.join(__dirname, 'worker-stage2.js');
     const child = fork(workerPath, [], { stdio: ['inherit','inherit','inherit','ipc'] });
     child.send({ type: 'start-session', payload: {
-      email: accountRow.email_id,
-      password: accountRow.password,
       urls,
       options: { headless: false, writeJson: false, minutePacing: true, verbose: false },
       jobId: job.jobId,
@@ -432,7 +404,7 @@ app.post('/stage2/auto-scrape', async (req,res) => {
       }
     });
 
-    return res.json({ jobId: job.jobId, assigned: urls.length, account: accountRow.email_id, userId: targetUserId });
+  return res.json({ jobId: job.jobId, assigned: urls.length, account: 'multi-account-cookie', userId: targetUserId });
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }

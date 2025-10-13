@@ -1,16 +1,11 @@
 import { createClient } from '@supabase/supabase-js';
 
-// const supabaseUrl = process.env.SUPABASE_URL;
-// const supabaseKey = process.env.SUPABASE_ANON_KEY;
-
-
-const supabaseUrl='https://ripdxiufkjiznfiqsrhe.supabase.co'
-const supabaseKey='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJpcGR4aXVma2ppem5maXFzcmhlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTg2OTgwODAsImV4cCI6MjA3NDI3NDA4MH0.ieJF9Qdvh8heAPcP72Ftd1UHwgT5zPe7yVBtECcOSpw'
-
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY;
 
 let supabase = null;
 if (supabaseUrl && supabaseKey) {
-  supabase = createClient(supabaseUrl, supabaseKey);
+  supabase = createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false } });
 }
 
 export async function saveToLeadDetails(lead) {
@@ -55,6 +50,48 @@ export async function saveToLeadDetails(lead) {
   }
 
   return { inserted: true };
+}
+
+export async function fetchOnePendingLead() {
+  if (!supabase) throw new Error('Supabase not configured');
+  const { data, error } = await supabase
+    .from('all_leads')
+    .select('lead_id, linkedin_url, created_at')
+    .eq('scrapped', false)
+    .order('created_at', { ascending: true })
+    .limit(1);
+  if (error) throw error;
+  return data?.[0] || null;
+}
+
+export async function fetchActiveAccountsWithCookies() {
+  if (!supabase) throw new Error('Supabase not configured');
+  const { data, error } = await supabase
+    .from('accounts')
+    .select('email_id, password, cookies, status')
+    .eq('status', 'active');
+  if (error) throw error;
+  return (data || []).filter(a => Array.isArray(a.cookies) && a.cookies.length);
+}
+
+export async function markAccountErrored(emailId) {
+  if (!supabase) throw new Error('Supabase not configured');
+  if (!emailId) return;
+  const { error } = await supabase
+    .from('accounts')
+    .update({ status: 'error' })
+    .eq('email_id', emailId);
+  if (error) throw error;
+}
+
+export async function updateAccountCookies(emailId, cookiesArray) {
+  if (!supabase) throw new Error('Supabase not configured');
+  if (!emailId || !Array.isArray(cookiesArray)) return;
+  const { error } = await supabase
+    .from('accounts')
+    .update({ cookies: cookiesArray })
+    .eq('email_id', emailId);
+  if (error) throw error;
 }
 
 
