@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
-  "main": "unified-server.js",
   "license": "MIT",
   "dependencies": {
     "dotenv": "^16.4.5",
