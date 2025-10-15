@@ -60,6 +60,34 @@ export async function fetchNextPendingRequest() {
   return data && data.length ? data[0] : null;
 }
 
+/**
+ * Fetch a batch of pending requests to process sequentially.
+ */
+export async function fetchAllPendingRequests(limit = 50) {
+  const client = getSupabase();
+  const { data, error } = await client
+    .from('requests')
+    .select('*')
+    .eq('is_fulfilled', false)
+    .order('created_at', { ascending: true })
+    .limit(Math.max(1, Math.min(500, limit)));
+  if (error) throw error;
+  return data || [];
+}
+
+/**
+ * Count all pending requests (is_fulfilled=false) without fetching rows.
+ */
+export async function fetchPendingRequestsCount() {
+  const client = getSupabase();
+  const { count, error } = await client
+    .from('requests')
+    .select('request_id', { count: 'exact', head: true })
+    .eq('is_fulfilled', false);
+  if (error) throw error;
+  return count || 0;
+}
+
 // Fetch all active accounts with cookies available
 export async function fetchActiveAccounts() {
   const client = getSupabase();
