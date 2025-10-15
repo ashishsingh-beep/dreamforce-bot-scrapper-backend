@@ -5,8 +5,9 @@ import { createClient } from '@supabase/supabase-js';
 import { chromium, devices } from 'playwright';
 import { loginWithCookiesThenCredentials } from './utils/login.js';
 import { scrapeProfile } from './utils/scrapeProfile.js';
-import { saveToLeadDetails, fetchActiveAccountsWithCookies, markAccountErrored, updateAccountCookies } from './utils/supabase.js';
+import { saveToLeadDetails, fetchRandomActiveAccount, markAccountErrored, updateAccountCookies } from './utils/supabase.js';
 import { setupStealthContext, preparePage, humanizePage } from './utils/stealth.js';
+import { logStage2Lead } from './utils/logger.js';
 import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -23,20 +24,9 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
 }
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-async function markLeadScrapped(linkedinUrl) {
-  if (!linkedinUrl) return;
-  // We assume lead_id not required for marking; using linkedin_url unique constraint assumption
-  const { error } = await supabase
-    .from('all_leads')
-    .update({ scrapped: true })
-    .eq('linkedin_url', linkedinUrl);
-  if (error) {
-    // eslint-disable-next-line no-console
-    console.warn('[worker] Failed to mark scrapped', linkedinUrl, error.message);
-  }
-}
+// removed URL-based scrapped marking; now handled by saveToLeadDetails via lead_id
 
-async function runSession({ urls, options }) {
+async function runSession({ leads, options }) {
   const launchOpts = {
     headless: options.headless,
     args: [
@@ -59,13 +49,13 @@ async function runSession({ urls, options }) {
   };
 
   const acquireSession = async () => {
-    // Load/refresh active accounts
-    let accounts = await fetchActiveAccountsWithCookies();
-    if (!accounts.length) return null;
-    // Shuffle tries across available accounts
-    while (accounts.length) {
-      const idx = Math.floor(Math.random() * accounts.length);
-      const account = accounts.splice(idx, 1)[0];
+    // Pick any random active account (with or without cookies)
+    let tried = 0;
+    const maxTries = 5;
+    while (tried < maxTries) {
+      const account = await fetchRandomActiveAccount();
+      if (!account) return null;
+      tried++;
       let context, page;
       try {
         context = await browser.newContext({
@@ -79,7 +69,7 @@ async function runSession({ urls, options }) {
         const hybrid = await loginWithCookiesThenCredentials({
           context,
           page,
-          cookies: account.cookies,
+          cookies: account.cookies || [],
           email: account.email_id,
           password: account.password,
         });
@@ -111,16 +101,17 @@ async function runSession({ urls, options }) {
   let session = null;
   let i = 0;
   const retryCount = new Map();
-  while (i < urls.length) {
+  while (i < leads.length) {
     // Acquire or re-acquire session if needed
     if (!session) {
       session = await acquireSession();
       if (!session) break; // no accounts available
     }
     const { page, context, account } = session;
-    const url = urls[i];
+    const { lead_id, linkedin_url } = leads[i] || {};
     try {
-      await page.goto(url, { waitUntil: 'domcontentloaded' });
+      if (!linkedin_url) throw new Error('Missing linkedin_url');
+      await page.goto(linkedin_url, { waitUntil: 'domcontentloaded' });
       // If we got logged out before/after navigation, drop session and retry same URL with a new account
       if (await isLoggedOut(page)) {
         // Close session, do not mark account error for forced logout mid-run
@@ -128,14 +119,18 @@ async function runSession({ urls, options }) {
         session = null;
         continue; // retry same i with a new session
       }
-      const lead = await scrapeProfile(page, url);
+      const lead = await scrapeProfile(page, linkedin_url);
       if (!lead) throw new Error('Empty lead data');
+      // attach lead_id from all_leads to ensure uniform IDs
+      lead.lead_id = lead_id || lead.lead_id || null;
+      // save and mark scrapped by lead_id internally
       await saveToLeadDetails(lead);
-      await markLeadScrapped(url);
+      // stage2 log
+      try { logStage2Lead({ lead_id: lead.lead_id, name: lead.name }); } catch {}
       success += 1;
-      i += 1; // move to next URL on success
-      process.send?.({ type: 'progress', success, failure, current: i, total: urls.length });
-      if (options.minutePacing && i < urls.length) {
+      i += 1; // move to next lead on success
+      process.send?.({ type: 'progress', success, failure, current: i, total: leads.length });
+      if (options.minutePacing && i < leads.length) {
         await new Promise(r => setTimeout(r, 10000));
       }
     } catch (e) {
@@ -149,7 +144,7 @@ async function runSession({ urls, options }) {
       // If session likely broke, drop it and reacquire
       await session.context.close().catch(()=>{});
       session = null;
-      process.send?.({ type: 'progress', success, failure, current: i, total: urls.length });
+      process.send?.({ type: 'progress', success, failure, current: i, total: leads.length });
     }
   }
 
@@ -160,9 +155,9 @@ async function runSession({ urls, options }) {
 
 process.on('message', async (msg) => {
   if (msg?.type === 'start-session') {
-    const { urls, options } = msg.payload;
+    const { leads, options } = msg.payload;
     try {
-      const { success, failure } = await runSession({ urls, options });
+      const { success, failure } = await runSession({ leads, options });
       process.send?.({ type: 'done', success, failure });
       process.exit(0);
     } catch (e) {

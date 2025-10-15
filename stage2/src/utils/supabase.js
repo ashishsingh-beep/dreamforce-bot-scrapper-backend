@@ -26,10 +26,21 @@ export async function saveToLeadDetails(lead) {
     company_name: lead.company_name ?? null,
     company_page_url: lead.company_page_url ?? null,
   };
-  const { error } = await supabase.from('lead_details').insert(row);
-  if (error) throw error;
+  let duplicate = false;
+  try {
+    const { error } = await supabase.from('lead_details').insert(row);
+    if (error) throw error;
+  } catch (e) {
+    // If duplicate key on lead_id, treat as already saved and continue to mark scrapped
+    const msg = e?.message || '';
+    if (e?.code === '23505' || /duplicate key value/i.test(msg) || /unique constraint/i.test(msg)) {
+      duplicate = true;
+    } else {
+      throw e;
+    }
+  }
 
-  // Mark scrapped true in all_leads (column name confirmed as 'scrapped')
+  // Mark scrapped true in all_leads strictly by lead_id (very important)
   if (row.lead_id) {
     try {
       const { error: updErr, data } = await supabase
@@ -49,7 +60,7 @@ export async function saveToLeadDetails(lead) {
     }
   }
 
-  return { inserted: true };
+  return { inserted: !duplicate, duplicate };
 }
 
 export async function fetchOnePendingLead() {
@@ -64,14 +75,17 @@ export async function fetchOnePendingLead() {
   return data?.[0] || null;
 }
 
-export async function fetchActiveAccountsWithCookies() {
+export async function fetchRandomActiveAccount() {
   if (!supabase) throw new Error('Supabase not configured');
   const { data, error } = await supabase
     .from('accounts')
     .select('email_id, password, cookies, status')
     .eq('status', 'active');
   if (error) throw error;
-  return (data || []).filter(a => Array.isArray(a.cookies) && a.cookies.length);
+  const arr = data || [];
+  if (!arr.length) return null;
+  const idx = Math.floor(Math.random() * arr.length);
+  return arr[idx];
 }
 
 export async function markAccountErrored(emailId) {

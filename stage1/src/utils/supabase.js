@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import { logStage1Lead } from './logger.js';
 
 let supabase = null;
 
@@ -33,6 +34,11 @@ export async function saveAllLeads(leads, userId = null, tag = null) {
     .upsert(payload, { onConflict: 'lead_id' })
     .select('lead_id');
   if (error) throw error;
+  try {
+    for (const row of data) {
+      if (row?.lead_id) logStage1Lead(row.lead_id);
+    }
+  } catch {}
   return { inserted: data.length };
 }
 

@@ -33,14 +33,14 @@ const jobs = new Map();
 let activeWorker = false;
 
 // Shape helper (single-account version)
-function createSingleJob(accountEmail, urls, mode='single') {
+function createSingleJob(accountEmail, count, mode='single') {
   return {
     jobId: uuidv4(),
     status: 'pending',
     createdAt: new Date().toISOString(),
     completedAt: null,
-    accounts: [{ idx:0, email: accountEmail, mode, assigned: urls.length, success:0, failure:0, state:'pending' }],
-    total: { assigned: urls.length, success:0, failure:0 },
+    accounts: [{ idx:0, email: accountEmail, mode, assigned: count, success:0, failure:0, state:'pending' }],
+    total: { assigned: count, success:0, failure:0 },
     errors: []
   };
 }
@@ -113,8 +113,8 @@ app.post('/stage2/scrape-multi', async (req,res) => {
     // Shuffle leads for fair distribution (optional)
     for (let i=leads.length-1;i>0;i--) { const j=Math.floor(Math.random()*(i+1)); [leads[i],leads[j]]=[leads[j],leads[i]]; }
 
-      const urlList = leads.map(l=>l.linkedin_url).filter(Boolean).slice(0,40);
-      const job = createSingleJob(account.email, urlList, 'multi-single');
+  const leadList = leads.map(l=>({ lead_id: l.lead_id, linkedin_url: l.linkedin_url })).filter(l=>l.linkedin_url).slice(0,40);
+  const job = createSingleJob(account.email, leadList.length, 'multi-single');
       jobs.set(job.jobId, job);
       job.status = 'running';
       job.accounts[0].state = 'running';
@@ -122,7 +122,7 @@ app.post('/stage2/scrape-multi', async (req,res) => {
       const workerPath = path.join(__dirname, 'worker-stage2.js');
       const child = fork(workerPath, [], { stdio: ['inherit','inherit','inherit','ipc'] });
       child.send({ type: 'start-session', payload: {
-        urls: urlList,
+        leads: leadList,
         options: { headless: false, writeJson: false, minutePacing: true, verbose: true },
         jobId: job.jobId,
         accountIndex: 0
@@ -149,7 +149,7 @@ app.post('/stage2/scrape-multi', async (req,res) => {
         job.completedAt = new Date().toISOString();
         activeWorker = false;
       });
-      res.json({ jobId: job.jobId, accounts: 1, totalAssigned: job.total.assigned, mode: 'single', capped: urlList.length });
+  res.json({ jobId: job.jobId, accounts: 1, totalAssigned: job.total.assigned, mode: 'single', capped: leadList.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -164,9 +164,17 @@ app.post('/stage2/scrape-batch', async (req,res) => {
     const first = jobList[0];
     if (!first?.email || !first?.password) return res.status(400).json({ error: 'email/password required for first job' });
     if (!Array.isArray(first.urls) || !first.urls.length) return res.status(400).json({ error: 'urls required' });
-    const uniq = Array.from(new Set(first.urls.filter(Boolean))).slice(0,40);
+    const uniq = Array.from(new Set(first.urls.filter(Boolean)));
     if (!uniq.length) return res.status(400).json({ error: 'No valid urls' });
-    const job = createSingleJob(first.email, uniq, 'batch-single');
+    const { data: mapped, error: mapErr } = await supabase
+      .from('all_leads')
+      .select('lead_id, linkedin_url')
+      .in('linkedin_url', uniq)
+      .eq('scrapped', false);
+    if (mapErr) return res.status(500).json({ error: mapErr.message });
+    const leadList = (mapped || []).map(l => ({ lead_id: l.lead_id, linkedin_url: l.linkedin_url })).slice(0,40);
+    if (!leadList.length) return res.status(400).json({ error: 'No pending leads for provided urls' });
+    const job = createSingleJob(first.email, leadList.length, 'batch-single');
     jobs.set(job.jobId, job);
     job.status = 'running';
     job.accounts[0].state = 'running';
@@ -174,7 +182,7 @@ app.post('/stage2/scrape-batch', async (req,res) => {
     const workerPath = path.join(__dirname, 'worker-stage2.js');
     const child = fork(workerPath, [], { stdio: ['inherit','inherit','inherit','ipc'] });
     child.send({ type: 'start-session', payload: {
-      urls: uniq,
+      leads: leadList,
       options: {
         headless: false,
         writeJson: false,
@@ -205,7 +213,7 @@ app.post('/stage2/scrape-batch', async (req,res) => {
       job.completedAt = new Date().toISOString();
       activeWorker = false;
     });
-    res.json({ jobId: job.jobId, accounts: 1, totalAssigned: job.total.assigned, mode: 'single', capped: uniq.length });
+  res.json({ jobId: job.jobId, accounts: 1, totalAssigned: job.total.assigned, mode: 'single', capped: leadList.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -215,6 +223,64 @@ app.get('/stage2/jobs/:jobId', (req,res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'job not found' });
   res.json(job);
+});
+
+// Synchronous random runner: pick N random pending leads (scrapped=false)
+app.post('/stage2/run-random', async (req, res) => {
+  try {
+    const { limit } = req.body || {};
+    if (activeWorker) return res.status(409).json({ error: 'Another scrape is in progress' });
+    const take = Math.min(Math.max(Number(limit)||10, 1), 50);
+    // Fetch a pool of pending leads and randomize client-side
+    const { data: pending, error } = await supabase
+      .from('all_leads')
+      .select('lead_id, linkedin_url')
+      .eq('scrapped', false)
+      .limit(200);
+    if (error) return res.status(500).json({ error: error.message });
+    if (!pending || !pending.length) return res.status(404).json({ error: 'No pending leads' });
+    for (let i=pending.length-1;i>0;i--) { const j=Math.floor(Math.random()*(i+1)); [pending[i],pending[j]]=[pending[j],pending[i]]; }
+    const leadList = pending.slice(0, take).map(l => ({ lead_id: l.lead_id, linkedin_url: l.linkedin_url })).filter(l=>l.linkedin_url);
+    if (!leadList.length) return res.status(400).json({ error: 'No valid linkedin_url among pending leads' });
+    const job = createSingleJob('random-active-account', leadList.length, 'random');
+    job.status = 'running';
+    job.accounts[0].state = 'running';
+    jobs.set(job.jobId, job);
+    activeWorker = true;
+    const workerPath = path.join(__dirname, 'worker-stage2.js');
+    const child = fork(workerPath, [], { stdio: ['inherit','inherit','inherit','ipc'] });
+    child.send({ type: 'start-session', payload: {
+      leads: leadList,
+      options: { headless: false, writeJson: false, minutePacing: true, verbose: false },
+      jobId: job.jobId,
+      accountIndex: 0
+    }});
+    child.on('message', (msg) => {
+      if (msg?.type === 'progress') {
+        job.accounts[0].success = msg.success;
+        job.accounts[0].failure = msg.failure;
+        job.total.success = msg.success;
+        job.total.failure = msg.failure;
+      } else if (msg?.type === 'done') {
+        job.accounts[0].success = msg.success;
+        job.accounts[0].failure = msg.failure;
+        job.accounts[0].state = 'done';
+      } else if (msg?.type === 'error') {
+        job.accounts[0].state = 'error';
+        job.accounts[0].failure += 1;
+        job.errors.push({ email: 'random-active-account', error: msg.error });
+      }
+    });
+    child.on('exit', (code) => {
+      if (job.accounts[0].state === 'running') job.accounts[0].state = code === 0 ? 'done':'error';
+      job.status = job.accounts[0].state === 'error' ? 'error' : 'completed';
+      job.completedAt = new Date().toISOString();
+      activeWorker = false;
+    });
+    res.json({ jobId: job.jobId, totalAssigned: job.total.assigned, mode: 'random' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ------------------------
@@ -256,9 +322,9 @@ if (AUTO_SCRAPE_ENABLED) {
         .order('created_at', { ascending: true })
         .limit(40);
       if (leadsErr || !leads || !leads.length) return;
-      const urls = leads.map(l => l.linkedin_url).filter(Boolean).slice(0,40);
-      if (!urls.length) return;
-      const job = createSingleJob('multi-account-cookie', urls, 'auto');
+  const leadList = leads.map(l => ({ lead_id: l.lead_id, linkedin_url: l.linkedin_url })).filter(l=>l.linkedin_url).slice(0,40);
+  if (!leadList.length) return;
+  const job = createSingleJob('multi-account-cookie', leadList.length, 'auto');
       job.status = 'running';
       job.accounts[0].state = 'running';
       job.auto = true;
@@ -267,7 +333,7 @@ if (AUTO_SCRAPE_ENABLED) {
       const workerPath = path.join(__dirname, 'worker-stage2.js');
       const child = fork(workerPath, [], { stdio: ['inherit','inherit','inherit','ipc'] });
       child.send({ type: 'start-session', payload: {
-        urls,
+        leads: leadList,
         options: { headless: false, writeJson: false, minutePacing: true, verbose: false },
         jobId: job.jobId,
         accountIndex: 0
@@ -349,8 +415,8 @@ app.post('/stage2/auto-scrape', async (req,res) => {
     if (!leads || !leads.length) return res.status(404).json({ error: 'No pending leads for user' });
 
     // Step 2: pick newest matching account
-    const urls = leads.map(l => l.linkedin_url).filter(Boolean);
-    if (!urls.length) return res.status(400).json({ error: 'Leads missing linkedin_url values' });
+  const leadList = leads.map(l => ({ lead_id: l.lead_id, linkedin_url: l.linkedin_url })).filter(l=>l.linkedin_url);
+  if (!leadList.length) return res.status(400).json({ error: 'Leads missing linkedin_url values' });
 
     // Create synthetic job structure mirroring batch endpoint (single account)
     const job = {
@@ -358,8 +424,8 @@ app.post('/stage2/auto-scrape', async (req,res) => {
       status: 'running',
       createdAt: new Date().toISOString(),
       completedAt: null,
-  accounts: [ { idx:0, email: 'multi-account-cookie', mode:'auto', assigned: urls.length, success:0, failure:0, state:'running' } ],
-      total: { assigned: urls.length, success:0, failure:0 },
+  accounts: [ { idx:0, email: 'multi-account-cookie', mode:'auto', assigned: leadList.length, success:0, failure:0, state:'running' } ],
+    total: { assigned: leadList.length, success:0, failure:0 },
       errors: [],
       auto: true,
       userId: targetUserId
@@ -369,7 +435,7 @@ app.post('/stage2/auto-scrape', async (req,res) => {
     const workerPath = path.join(__dirname, 'worker-stage2.js');
     const child = fork(workerPath, [], { stdio: ['inherit','inherit','inherit','ipc'] });
     child.send({ type: 'start-session', payload: {
-      urls,
+      leads: leadList,
       options: { headless: false, writeJson: false, minutePacing: true, verbose: false },
       jobId: job.jobId,
       accountIndex: 0
@@ -404,7 +470,7 @@ app.post('/stage2/auto-scrape', async (req,res) => {
       }
     });
 
-  return res.json({ jobId: job.jobId, assigned: urls.length, account: 'multi-account-cookie', userId: targetUserId });
+  return res.json({ jobId: job.jobId, assigned: leadList.length, account: 'multi-account-cookie', userId: targetUserId });
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
